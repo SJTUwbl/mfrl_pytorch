@@ -20,29 +20,34 @@ class Base(nn.Module):
         self.l1 = nn.Linear(np.prod(view_space), hidden_size)
         # for input_feature
         self.l2 = nn.Linear(feature_space[0], hidden_size)
-        # for dense
-        self.l3 = nn.Linear(hidden_size*2, hidden_size*2)
+        # for input_act_prob
+        self.l3 = nn.Linear(num_actions, 64)
+        self.l4 = nn.Linear(64, 32)
 
-    def forward(self, input_view, input_feature):
+    def forward(self, input_view, input_feature, input_act_prob):
         # flatten_view = torch.FloatTensor(input_view)
         flatten_view = input_view.reshape(-1, np.prod(self.view_space))
         h_view = F.relu(self.l1(flatten_view))
 
         h_emb  = F.relu(self.l2(input_feature))
 
-        dense = torch.cat([h_view, h_emb], dim=1)
-        dense = F.relu(self.l3(dense))
-        return dense
+        emb_prob = F.relu(self.l3(input_act_prob))
+        dense_prob = F.relu(self.l4(emb_prob))
+
+        concat_layer = torch.cat([h_view, h_emb, dense_prob], dim=1)
+        return concat_layer
 
 class Actor(nn.Module):
     """docstring for Actor"""
     def __init__(self, hidden_size, num_actions):
         super(Actor, self).__init__()
 
-        self.l1 = nn.Linear(hidden_size*2, num_actions)
+        self.l1 = nn.Linear(32 + 2 * hidden_size, hidden_size * 2)
+        self.l2 = nn.Linear(hidden_size * 2, num_actions)
 
-    def forward(self, dense):
-        policy = F.softmax(self.l1(dense / 0.1), dim=1)
+    def forward(self, concat_layer):
+        dense = F.relu(self.l1(concat_layer))
+        policy = F.softmax(self.l2(dense / 0.1), dim=-1)
         policy = policy.clamp(1e-10, 1-1e-10)
         return policy
 
@@ -51,14 +56,16 @@ class Critic(nn.Module):
     def __init__(self, hidden_size):
         super(Critic, self).__init__()
 
-        self.l1 = nn.Linear(hidden_size*2, 1)
+        self.l1 = nn.Linear(32 + 2 * hidden_size, hidden_size)
+        self.l2 = nn.Linear(hidden_size, 1)
 
-    def forward(self, dense):
-        value = self.l1(dense)
+    def forward(self, concat_layer):
+        dense = F.relu(self.l1(concat_layer))
+        value = self.l2(dense)
         value = value.reshape(-1)
         return value
 
-class AC:
+class MFAC:
     """docstring for MFAC"""
     def __init__(self, handle, env, value_coef=0.1, ent_coef=0.08, gamma=0.95, batch_size=64, learning_rate=1e-4):
         self.env = env
@@ -94,7 +101,8 @@ class AC:
     def act(self, **kwargs):
         input_view = torch.FloatTensor(kwargs['state'][0]).to(device)
         input_feature = torch.FloatTensor(kwargs['state'][1]).to(device)
-        concat_layer = self.base(input_view, input_feature)
+        input_act_prob = torch.FloatTensor(kwargs['prob']).to(device)
+        concat_layer = self.base(input_view, input_feature, input_act_prob)
         policy = self.actor(concat_layer)
         action = torch.multinomial(policy, 1)
         action = action.cpu().numpy()
@@ -114,21 +122,24 @@ class AC:
         feature = torch.FloatTensor(n, *self.feature_space).to(device)
         action = torch.LongTensor(n).to(device)
         reward = torch.FloatTensor(n).to(device)
+        act_prob_buff = torch.FloatTensor(n, self.num_actions).to(device)
 
         ct = 0
         gamma = self.reward_decay
         # collect episodes from multiple separate buffers to a continuous buffer
         for k, episode in enumerate(batch_data):
-            v, f, a, r = episode.views, episode.features, episode.actions, episode.rewards
+            v, f, a, r, prob = episode.views, episode.features, episode.actions, episode.rewards, episode.probs
             v = torch.FloatTensor(v).to(device)
             f = torch.FloatTensor(f).to(device)
             r = torch.FloatTensor(r).to(device)
             a = torch.LongTensor(a).to(device)
+            prob = torch.FloatTensor(prob).to(device)
 
             m = len(episode.rewards)
+            assert len(episode.probs) > 0
 
-            dense = self.base(v[-1].reshape(1, -1), f[-1].reshape(1, -1))
-            keep = self.critic(dense)[0]
+            concat_layer = self.base(v[-1].reshape(1, -1), f[-1].reshape(1, -1), prob[-1].reshape(1, -1))
+            keep = self.critic(concat_layer)[0]
 
             for i in reversed(range(m)):
                 keep = keep * gamma + r[i]
@@ -138,14 +149,15 @@ class AC:
             feature[ct:ct + m] = f
             action[ct:ct + m] = a
             reward[ct:ct + m] = r
+            act_prob_buff[ct:ct + m] = prob
             ct += m
 
         assert n == ct
 
         # train
-        dense = self.base(view, feature)
-        value = self.critic(dense)
-        policy = self.actor(dense)
+        concat_layer = self.base(view, feature, act_prob_buff)
+        value = self.critic(concat_layer)
+        policy = self.actor(concat_layer)
 
         action_mask = F.one_hot(action, self.num_actions)
         advantage = (reward - value).detach()
@@ -179,13 +191,13 @@ class AC:
             'critic': self.critic.state_dict()
         }
 
-        file_path = os.path.join(dir_path, "ac.pth")
+        file_path = os.path.join(dir_path, "mfac.pth")
         torch.save(model_vars, file_path)
 
         print("[*] Model saved at: {}".format(file_path))
 
     def load(self, dir_path):
-        file_path = os.path.join(dir_path, "ac.pth")
+        file_path = os.path.join(dir_path, "mfac.pth")
         model_vars = torch.load(file_path)
 
         self.base.load_state_dict(model_vars['base'])

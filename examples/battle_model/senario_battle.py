@@ -172,8 +172,6 @@ def battle(env, n_round, map_size, max_steps, handles, models, print_every, eps=
         for i in range(n_group):
             former_act_prob[i] = np.mean(list(map(lambda x: np.eye(n_action[i])[x], acts[i])), axis=0, keepdims=True)
 
-        # stat info
-        nums = [env.get_num(handle) for handle in handles]
 
         for i in range(n_group):
             sum_reward = sum(rewards[i])
@@ -186,11 +184,11 @@ def battle(env, n_round, map_size, max_steps, handles, models, print_every, eps=
 
         # clear dead agents
         env.clear_dead()
-
+        # stat info
+        nums = [env.get_num(handle) for handle in handles]
         info = {"Ave-Reward": np.round(rewards, decimals=6), "NUM": nums}
 
         step_ct += 1
-
         if step_ct % print_every == 0:
             print("> step #{}, info: {}".format(step_ct, info))
 
